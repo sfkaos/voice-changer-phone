@@ -94,7 +94,7 @@ export class AudioBridge {
     }
 
     if (!bridge.twilioStream || !bridge.twilioStreamSid) {
-      logger.warn(`Cannot forward audio - Twilio stream not connected for call ${callId}`);
+      logger.debug(`Waiting for Twilio stream to connect for call ${callId}`);
       return;
     }
 

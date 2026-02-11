@@ -214,6 +214,7 @@ export function handleClientAudioStream(socket, options) {
   let clientSampleRate = null;
   let audioChunkCount = 0;
   let pcmAudioBuffer = null; // AudioBuffer for PCM at client sample rate
+  let isProcessing = false;  // Serialize ElevenLabs requests (max 3 concurrent on Starter plan)
   const latencyTracker = new LatencyTracker();
 
   logger.info(`Client audio stream started for call ${callId}, voice preset: ${voicePreset}`);
@@ -241,8 +242,22 @@ export function handleClientAudioStream(socket, options) {
   async function processClientBuffer() {
     if (!pcmAudioBuffer) return;
 
+    // Don't send to ElevenLabs if Twilio isn't connected yet (call still ringing)
+    const bridgeStatus = audioBridge.getBridgeStatus(callId);
+    if (!bridgeStatus || !bridgeStatus.twilioConnected) {
+      pcmAudioBuffer.flush(); // Discard buffered audio — nowhere to send it
+      return;
+    }
+
+    // Serialize: only one ElevenLabs request at a time to avoid 429 rate limits
+    if (isProcessing) return;
+    isProcessing = true;
+
     const pcmChunk = pcmAudioBuffer.flush();
-    if (!pcmChunk || pcmChunk.length === 0) return;
+    if (!pcmChunk || pcmChunk.length === 0) {
+      isProcessing = false;
+      return;
+    }
 
     const startTime = Date.now();
 
@@ -279,6 +294,8 @@ export function handleClientAudioStream(socket, options) {
 
     } catch (error) {
       logger.error(`Client audio transform error for call ${callId}: ${error.message}`);
+    } finally {
+      isProcessing = false;
     }
   }
 
