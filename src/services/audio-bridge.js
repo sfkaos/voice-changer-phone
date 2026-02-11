@@ -31,6 +31,7 @@ export class AudioBridge {
       twilioStreamSid: null,
       audioQueue: [],
       isProcessing: false,
+      clientSampleRate: null,
       startTime: Date.now()
     };
     
@@ -79,6 +80,36 @@ export class AudioBridge {
     }
   }
   
+  /**
+   * Store the client's audio sample rate on the bridge
+   */
+  setClientSampleRate(callId, sampleRate) {
+    const bridge = this.activeBridges.get(callId);
+    if (!bridge) return;
+    bridge.clientSampleRate = sampleRate;
+    logger.info(`Client sample rate set to ${sampleRate}Hz for call ${callId}`);
+  }
+
+  /**
+   * Get the client's audio sample rate from the bridge
+   */
+  getClientSampleRate(callId) {
+    const bridge = this.activeBridges.get(callId);
+    return bridge ? bridge.clientSampleRate : null;
+  }
+
+  /**
+   * Forward callee PCM audio to the client browser WebSocket
+   */
+  forwardAudioToClient(callId, pcmBuffer) {
+    const bridge = this.activeBridges.get(callId);
+    if (!bridge || !bridge.clientStream) return;
+
+    if (bridge.clientStream.readyState === bridge.clientStream.OPEN) {
+      bridge.clientStream.send(pcmBuffer);
+    }
+  }
+
   /**
    * Forward already-transformed mu-law audio to the Twilio Media Stream.
    * Called by media-stream.js after the full PCM -> transform -> resample -> mulaw pipeline.

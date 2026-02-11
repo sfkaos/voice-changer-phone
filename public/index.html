@@ -488,6 +488,7 @@
     let micDataArray = null;
     let audioWebSocket = null;
     let isStreamingAudio = false;
+    let nextPlaybackTime = 0;
     
     // Load voices on page load
     document.addEventListener('DOMContentLoaded', () => {
@@ -604,6 +605,13 @@
 
       audioWebSocket = new WebSocket(wsUrl);
 
+      audioWebSocket.binaryType = 'arraybuffer';
+
+      audioWebSocket.onmessage = function(event) {
+        if (typeof event.data === 'string') return;
+        playCalleePCM(event.data);
+      };
+
       audioWebSocket.onopen = function() {
         console.log('Audio WebSocket connected');
         isStreamingAudio = true;
@@ -667,6 +675,25 @@
       }
     }
     
+    // Play callee PCM audio received from server
+    function playCalleePCM(arrayBuffer) {
+      if (!audioContext || audioContext.state !== 'running') return;
+      const int16 = new Int16Array(arrayBuffer);
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) {
+        float32[i] = int16[i] / 32768;
+      }
+      const buf = audioContext.createBuffer(1, float32.length, audioContext.sampleRate);
+      buf.getChannelData(0).set(float32);
+      const source = audioContext.createBufferSource();
+      source.buffer = buf;
+      source.connect(audioContext.destination);
+      const now = audioContext.currentTime;
+      if (nextPlaybackTime < now) nextPlaybackTime = now;
+      source.start(nextPlaybackTime);
+      nextPlaybackTime += buf.duration;
+    }
+
     // Load available voices
     async function loadVoices() {
       try {
@@ -889,6 +916,7 @@
       activeCallSid = null;
       callStartTime = null;
       isStreamingAudio = false;
+      nextPlaybackTime = 0;
       
       // Refresh stats
       loadStats();

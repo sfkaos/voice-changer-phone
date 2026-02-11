@@ -74,10 +74,16 @@ export function handleMediaStream(socket, options) {
           audioBridge.connectTwilioStream(callId, socket, streamSid);
           break;
           
-        case 'media':
-          // Callee audio received from Twilio — no processing needed for now
-          // Future: forward to browser so caller can hear the callee
+        case 'media': {
+          const clientRate = audioBridge.getClientSampleRate(callId);
+          if (!clientRate) break;
+
+          const mulawBytes = Buffer.from(message.media.payload, 'base64');
+          const pcm8k = mulawDecode(mulawBytes);
+          const pcmClient = resample(pcm8k, SAMPLE_RATE_TWILIO, clientRate);
+          audioBridge.forwardAudioToClient(callId, pcmClient);
           break;
+        }
           
         case 'mark':
           // Audio playback marker (optional tracking)
@@ -271,6 +277,7 @@ export function handleClientAudioStream(socket, options) {
             // AudioBuffer expects bytesPerMs as sampleRate/1000 (for 1-byte-per-sample formats)
             // For 16-bit PCM, we create the buffer with sampleRate*2 to account for 2 bytes/sample
             pcmAudioBuffer = new AudioBuffer(BUFFER_MS, clientSampleRate * 2);
+            audioBridge.setClientSampleRate(callId, clientSampleRate);
             logger.info(`Client audio config: sampleRate=${clientSampleRate}, channels=${config.channels}, encoding=${config.encoding} for call ${callId}`);
             return;
           }
@@ -278,6 +285,7 @@ export function handleClientAudioStream(socket, options) {
           // Not JSON - could be binary PCM without config, default to 48kHz
           clientSampleRate = 48000;
           pcmAudioBuffer = new AudioBuffer(BUFFER_MS, clientSampleRate * 2);
+          audioBridge.setClientSampleRate(callId, clientSampleRate);
           logger.warn(`No config message received, defaulting to ${clientSampleRate}Hz for call ${callId}`);
         }
       }
