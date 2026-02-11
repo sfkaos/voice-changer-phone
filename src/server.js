@@ -54,20 +54,29 @@ const audioBridge = new AudioBridge(voiceTransformer);
 // ============================================
 // WebSocket Routes
 // ============================================
+
+// Log all incoming requests to detect Twilio WebSocket upgrade attempts
+fastify.addHook('onRequest', (request, reply, done) => {
+  if (request.url.startsWith('/media-stream')) {
+    logger.info(`>>> HTTP request to /media-stream: method=${request.method} upgrade=${request.headers.upgrade || 'none'} url=${request.url} ip=${request.headers['x-forwarded-for'] || request.ip} ua=${request.headers['user-agent']}`);
+  }
+  done();
+});
+
 fastify.register(async function (fastify) {
   // Twilio Media Streams (receives audio from called person)
   fastify.get('/media-stream', { websocket: true }, (socket, req) => {
+    // Read params from URL query string as fallback; primary source is Twilio's 'start' customParameters
     const params = new URL(req.url, `http://${req.headers.host}`).searchParams;
     const voicePreset = params.get('voicePreset') || 'deep_male';
     const callId = params.get('callId') || 'unknown';
-    
-    logger.info(`🔌 TWILIO Media Stream WebSocket Connection Attempt`);
+
+    logger.info(`TWILIO Media Stream WebSocket CONNECTED`);
     logger.info(`   Call ID: ${callId}`);
     logger.info(`   Voice Preset: ${voicePreset}`);
     logger.info(`   Client IP: ${req.headers['x-forwarded-for'] || req.ip}`);
-    logger.info(`   Full URL: ${req.url}`);
-    logger.info(`   User Agent: ${req.headers['user-agent']}`);
-    
+    logger.info(`   URL: ${req.url}`);
+
     handleMediaStream(socket, {
       callId,
       voicePreset,
@@ -120,19 +129,18 @@ fastify.post('/voice', async (request, reply) => {
   
   // Build TwiML response
   const host = process.env.SERVER_URL?.replace(/^https?:\/\//, '') || request.headers.host;
-  const wsUrl = `wss://${host}/media-stream?voicePreset=${voicePreset}&amp;callId=${callId}`;
-  
+  // Use clean URL without query params — params are passed via <Parameter> elements
+  const wsUrl = `wss://${host}/media-stream`;
+
   // TwiML for outbound call with voice transformation
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Matthew">Connecting your call with voice transformation.</Say>
   <Connect>
-    <Stream url="${wsUrl}" track="both_tracks">
+    <Stream url="${wsUrl}">
       <Parameter name="voicePreset" value="${voicePreset}" />
       <Parameter name="callId" value="${callId}" />
     </Stream>
   </Connect>
-  <Pause length="3600" />
 </Response>`;
 
   logger.info(`Generated TwiML: ${twiml}`);
@@ -147,13 +155,12 @@ fastify.get('/voice', async (request, reply) => {
   logger.info(`TwiML test request - Voice: ${voicePreset}`);
   
   const host = process.env.SERVER_URL?.replace(/^https?:\/\//, '') || request.headers.host;
-  const wsUrl = `wss://${host}/media-stream?voicePreset=${voicePreset}&amp;callId=test123`;
-  
+  const wsUrl = `wss://${host}/media-stream`;
+
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Matthew">Test TwiML generated successfully. Voice preset: ${voicePreset}</Say>
   <Connect>
-    <Stream url="${wsUrl}" track="both_tracks">
+    <Stream url="${wsUrl}">
       <Parameter name="voicePreset" value="${voicePreset}" />
       <Parameter name="callId" value="test123" />
     </Stream>

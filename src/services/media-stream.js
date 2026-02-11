@@ -18,21 +18,20 @@ const SAMPLE_RATE_ELEVENLABS = 16000;  // ElevenLabs optimal input rate
  * Handle a Twilio Media Stream WebSocket connection
  */
 export function handleMediaStream(socket, options) {
-  const { callId, voicePreset, callManager, voiceTransformer, audioBridge, logger } = options;
-  
-  logger.info(`🔌 Twilio Media Stream WebSocket CONNECTED for call ${callId}`);
-  
+  const { callManager, voiceTransformer, audioBridge, logger } = options;
+  // callId and voicePreset may come from URL query (fallback) or Twilio 'start' customParameters (preferred)
+  let callId = options.callId || 'unknown';
+  let voicePreset = options.voicePreset || 'deep_male';
+
+  logger.info(`Twilio Media Stream WebSocket CONNECTED (initial callId=${callId})`);
+
   // State
   let streamSid = null;
   let isConnected = false;
   const audioBuffer = new AudioBuffer(BUFFER_MS, SAMPLE_RATE_TWILIO);
   const latencyTracker = new LatencyTracker();
   
-  // Track active call
-  callManager.addActiveStream(callId, {
-    voicePreset,
-    startTime: Date.now(),
-  });
+  // Active stream tracking is deferred to 'start' event when we have the real callId
   
   // Process buffered audio
   async function processAudioBuffer() {
@@ -107,10 +106,20 @@ export function handleMediaStream(socket, options) {
         case 'start':
           streamSid = message.start.streamSid;
           const customParams = message.start.customParameters || {};
-          
-          logger.info(`📞 Twilio Stream started: ${streamSid} for call ${callId}`);
-          logger.debug(`Stream params: ${JSON.stringify(customParams)}`);
-          
+
+          // Update callId and voicePreset from Twilio's custom parameters (set via <Parameter> in TwiML)
+          if (customParams.callId) callId = customParams.callId;
+          if (customParams.voicePreset) voicePreset = customParams.voicePreset;
+
+          logger.info(`Twilio Stream started: streamSid=${streamSid} callId=${callId} voice=${voicePreset}`);
+          logger.info(`Custom params: ${JSON.stringify(customParams)}`);
+
+          // Track active call now that we have the real callId
+          callManager.addActiveStream(callId, {
+            voicePreset,
+            startTime: Date.now(),
+          });
+
           // Initialize voice transformer for this stream
           await voiceTransformer.initializeStream(callId, voicePreset);
 
