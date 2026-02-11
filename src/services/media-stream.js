@@ -10,7 +10,7 @@ import { mulawDecode, mulawEncode, resample } from '../utils/audio-codec.js';
 import { LatencyTracker } from '../utils/latency-tracker.js';
 
 // Configuration
-const BUFFER_MS = parseInt(process.env.AUDIO_BUFFER_MS) || 200;
+const BUFFER_MS = parseInt(process.env.AUDIO_BUFFER_MS) || 500;
 const SAMPLE_RATE_TWILIO = 8000;  // Twilio's μ-law sample rate
 const SAMPLE_RATE_ELEVENLABS = 16000;  // ElevenLabs optimal input rate
 
@@ -144,7 +144,8 @@ export function handleClientAudioStream(socket, options) {
   let clientSampleRate = null;
   let audioChunkCount = 0;
   let pcmAudioBuffer = null; // AudioBuffer for PCM at client sample rate
-  let isProcessing = false;  // Serialize ElevenLabs requests (max 3 concurrent on Starter plan)
+  let activeRequests = 0;
+  const MAX_CONCURRENT_REQUESTS = 2; // ElevenLabs Starter plan allows 3 concurrent — leave 1 headroom
   const latencyTracker = new LatencyTracker();
 
   logger.info(`Client audio stream started for call ${callId}, voice preset: ${voicePreset}`);
@@ -168,7 +169,11 @@ export function handleClientAudioStream(socket, options) {
     logger.error(`Failed to initialize voice transformer for call ${callId}: ${err.message}`);
   });
 
-  // Process buffered PCM: resample -> transform -> resample -> mulaw -> Twilio
+  // Size of each Twilio-bound chunk: 160ms of 16kHz 16-bit PCM = 5120 bytes
+  // After resample to 8kHz mulaw this becomes ~1280 bytes (~160ms of audio)
+  const STREAM_CHUNK_BYTES = 5120;
+
+  // Process buffered PCM: resample -> stream transform -> resample -> mulaw -> Twilio
   async function processClientBuffer() {
     if (!pcmAudioBuffer) return;
 
@@ -179,17 +184,18 @@ export function handleClientAudioStream(socket, options) {
       return;
     }
 
-    // Serialize: only one ElevenLabs request at a time to avoid 429 rate limits
-    if (isProcessing) return;
-    isProcessing = true;
+    // Bounded concurrency: allow up to MAX_CONCURRENT_REQUESTS in-flight
+    if (activeRequests >= MAX_CONCURRENT_REQUESTS) return;
+    activeRequests++;
 
     const pcmChunk = pcmAudioBuffer.flush();
     if (!pcmChunk || pcmChunk.length === 0) {
-      isProcessing = false;
+      activeRequests--;
       return;
     }
 
     const startTime = Date.now();
+    let firstChunkTime = null;
 
     try {
       // 1. Resample from client sample rate to 16kHz for ElevenLabs
@@ -199,41 +205,56 @@ export function handleClientAudioStream(socket, options) {
         logger.info(`Pipeline[${callId}]: input=${pcmChunk.length}B@${clientSampleRate}Hz -> resampled=${pcm16k.length}B@${SAMPLE_RATE_ELEVENLABS}Hz`);
       }
 
-      // 2. Transform voice via ElevenLabs (the core feature)
-      const transformedPcm = await voiceTransformer.transform(pcm16k, voicePreset, {
+      // 2. Stream-transform voice via ElevenLabs
+      // Accumulate streamed PCM and forward to Twilio in ~160ms chunks
+      let accumulator = Buffer.alloc(0);
+      let chunksSent = 0;
+
+      await voiceTransformer.transformStream(pcm16k, voicePreset, {
         sampleRate: SAMPLE_RATE_ELEVENLABS,
+      }, (streamedPcm) => {
+        if (!firstChunkTime) firstChunkTime = Date.now();
+
+        accumulator = Buffer.concat([accumulator, streamedPcm]);
+
+        // Forward complete ~160ms chunks as they accumulate
+        while (accumulator.length >= STREAM_CHUNK_BYTES) {
+          const slice = accumulator.subarray(0, STREAM_CHUNK_BYTES);
+          accumulator = accumulator.subarray(STREAM_CHUNK_BYTES);
+
+          // 3. Resample 16kHz -> 8kHz, encode to mu-law, forward to Twilio
+          const pcm8k = resample(Buffer.from(slice), SAMPLE_RATE_ELEVENLABS, SAMPLE_RATE_TWILIO);
+          const mulawOutput = mulawEncode(pcm8k);
+          audioBridge.forwardAudioToTwilio(callId, mulawOutput);
+          chunksSent++;
+        }
       });
 
-      if (!transformedPcm || transformedPcm.length === 0) {
-        logger.warn(`Empty transformation result for call ${callId}`);
-        return;
+      // Flush any remaining accumulated PCM
+      if (accumulator.length > 0) {
+        const pcm8k = resample(accumulator, SAMPLE_RATE_ELEVENLABS, SAMPLE_RATE_TWILIO);
+        const mulawOutput = mulawEncode(pcm8k);
+        audioBridge.forwardAudioToTwilio(callId, mulawOutput);
+        chunksSent++;
       }
-
-      // 3. Resample transformed audio from 16kHz to 8kHz for Twilio
-      const pcm8k = resample(transformedPcm, SAMPLE_RATE_ELEVENLABS, SAMPLE_RATE_TWILIO);
-
-      // 4. Encode to mu-law
-      const mulawOutput = mulawEncode(pcm8k);
-
-      if (audioChunkCount <= 5) {
-        logger.info(`Pipeline[${callId}]: transformed=${transformedPcm.length}B -> 8k=${pcm8k.length}B -> mulaw=${mulawOutput.length}B`);
-      }
-
-      // 5. Forward to Twilio via the audio bridge
-      audioBridge.forwardAudioToTwilio(callId, mulawOutput);
 
       // Track latency
       const processingTime = Date.now() - startTime;
+      const timeToFirst = firstChunkTime ? firstChunkTime - startTime : processingTime;
       latencyTracker.record(processingTime);
 
-      if (processingTime > 400) {
-        logger.warn(`High client audio latency: ${processingTime}ms for call ${callId}`);
+      if (audioChunkCount <= 5) {
+        logger.info(`Pipeline[${callId}]: streamed ${chunksSent} chunks, first-chunk=${timeToFirst}ms, total=${processingTime}ms`);
+      }
+
+      if (timeToFirst > 1000) {
+        logger.warn(`Slow first-chunk latency: ${timeToFirst}ms for call ${callId}`);
       }
 
     } catch (error) {
       logger.error(`Client audio transform error for call ${callId}: ${error.message}`);
     } finally {
-      isProcessing = false;
+      activeRequests--;
     }
   }
 
@@ -272,7 +293,7 @@ export function handleClientAudioStream(socket, options) {
       // Buffer the PCM data
       pcmAudioBuffer.push(audioData);
 
-      // Process when buffer has accumulated enough data (~200ms)
+      // Process when buffer has accumulated enough data (~500ms)
       if (pcmAudioBuffer.isReady()) {
         processClientBuffer().catch(err => {
           logger.error(`Async client audio processing error: ${err.message}`);

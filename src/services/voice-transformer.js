@@ -103,7 +103,63 @@ export class VoiceTransformer {
   }
   
   /**
-   * Call ElevenLabs Speech-to-Speech API
+   * Transform audio using ElevenLabs Speech-to-Speech streaming API
+   *
+   * Calls the /stream endpoint and delivers PCM chunks incrementally via onChunk callback,
+   * enabling much lower time-to-first-audio than the non-streaming transform().
+   *
+   * @param {Buffer} pcmBuffer - PCM audio data (16-bit signed, 16kHz)
+   * @param {string} voicePreset - Voice preset ID
+   * @param {object} options - Additional options
+   * @param {function(Buffer): void} onChunk - Called with each PCM chunk as it arrives
+   * @returns {Promise<void>}
+   */
+  async transformStream(pcmBuffer, voicePreset, options = {}, onChunk) {
+    if (!API_KEY) {
+      logger.debug('No API key - passing through audio unchanged');
+      onChunk(pcmBuffer);
+      return;
+    }
+
+    const voiceId = getVoiceId(voicePreset);
+    if (!voiceId) {
+      logger.error(`Unknown voice preset: ${voicePreset}`);
+      onChunk(pcmBuffer);
+      return;
+    }
+
+    const sampleRate = options.sampleRate || 16000;
+
+    try {
+      const wavBuffer = this.pcmToWav(pcmBuffer, sampleRate);
+
+      const useMultilingual = process.env.USE_MULTILINGUAL_MODEL === 'true';
+      const modelId = useMultilingual ? MULTILINGUAL_MODEL : DEFAULT_MODEL;
+
+      await this.callSpeechToSpeechStreamAPI(voiceId, wavBuffer, {
+        modelId,
+        outputFormat: `pcm_${sampleRate}`,
+        voiceSettings: VOICE_PRESETS[voicePreset]?.settings || {
+          stability: 0.5,
+          similarity_boost: 0.75,
+          style: 0.0,
+          use_speaker_boost: true,
+        },
+      }, onChunk);
+
+      // Track usage
+      const audioSeconds = pcmBuffer.length / (sampleRate * 2);
+      this.usageTracker.totalAudioSeconds += audioSeconds;
+
+    } catch (error) {
+      logger.error(`Voice transformation (stream) failed: ${error.message}`);
+      // Return original audio on error to maintain call continuity
+      onChunk(pcmBuffer);
+    }
+  }
+
+  /**
+   * Call ElevenLabs Speech-to-Speech API (non-streaming, full response)
    */
   async callSpeechToSpeechAPI(voiceId, audioBuffer, options) {
     const { modelId, outputFormat, voiceSettings } = options;
@@ -136,6 +192,48 @@ export class VoiceTransformer {
     const arrayBuffer = await response.arrayBuffer();
     logger.info(`ElevenLabs response: ${arrayBuffer.byteLength} bytes, content-type: ${response.headers.get('content-type')}`);
     return Buffer.from(arrayBuffer);
+  }
+
+  /**
+   * Call ElevenLabs Speech-to-Speech streaming API
+   * Iterates response body and delivers chunks via onChunk callback.
+   */
+  async callSpeechToSpeechStreamAPI(voiceId, audioBuffer, options, onChunk) {
+    const { modelId, outputFormat, voiceSettings } = options;
+
+    const formData = new FormData();
+    formData.append('audio', new Blob([audioBuffer], { type: 'audio/wav' }), 'input.wav');
+    formData.append('model_id', modelId);
+
+    if (voiceSettings) {
+      formData.append('voice_settings', JSON.stringify(voiceSettings));
+    }
+
+    const url = `${ELEVENLABS_API_URL}/speech-to-speech/${voiceId}/stream?output_format=${outputFormat}&optimize_streaming_latency=3`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': API_KEY,
+      },
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`ElevenLabs stream API error: ${response.status} - ${errorText}`);
+    }
+
+    logger.info(`ElevenLabs stream response: transfer-encoding=${response.headers.get('transfer-encoding')}, content-type=${response.headers.get('content-type')}`);
+
+    let totalBytes = 0;
+    for await (const chunk of response.body) {
+      const buf = Buffer.from(chunk);
+      totalBytes += buf.length;
+      onChunk(buf);
+    }
+
+    logger.info(`ElevenLabs stream complete: ${totalBytes} bytes total`);
   }
   
   /**
