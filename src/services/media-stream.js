@@ -28,69 +28,11 @@ export function handleMediaStream(socket, options) {
   // State
   let streamSid = null;
   let isConnected = false;
-  const audioBuffer = new AudioBuffer(BUFFER_MS, SAMPLE_RATE_TWILIO);
-  const latencyTracker = new LatencyTracker();
   
-  // Active stream tracking is deferred to 'start' event when we have the real callId
-  
-  // Process buffered audio
-  async function processAudioBuffer() {
-    if (!isConnected || !streamSid) return;
-    
-    const chunk = audioBuffer.flush();
-    if (!chunk || chunk.length === 0) return;
-    
-    const startTime = Date.now();
-    
-    try {
-      // 1. Decode μ-law to PCM (16-bit signed)
-      const pcmBuffer = mulawDecode(chunk);
-      
-      // 2. Resample from 8kHz to 16kHz for ElevenLabs
-      const resampledPcm = resample(pcmBuffer, SAMPLE_RATE_TWILIO, SAMPLE_RATE_ELEVENLABS);
-      
-      // 3. Transform voice via ElevenLabs
-      const transformedPcm = await voiceTransformer.transform(resampledPcm, voicePreset, {
-        sampleRate: SAMPLE_RATE_ELEVENLABS,
-      });
-      
-      if (!transformedPcm || transformedPcm.length === 0) {
-        logger.warn(`Empty transformation result for call ${callId}`);
-        return;
-      }
-      
-      // 4. Resample back to 8kHz for Twilio
-      const outputPcm = resample(transformedPcm, SAMPLE_RATE_ELEVENLABS, SAMPLE_RATE_TWILIO);
-      
-      // 5. Encode to μ-law
-      const mulawOutput = mulawEncode(outputPcm);
-      
-      // 6. Send back to Twilio
-      const mediaMessage = {
-        event: 'media',
-        streamSid: streamSid,
-        media: {
-          payload: mulawOutput.toString('base64'),
-        },
-      };
-      
-      if (socket.readyState === socket.OPEN) {
-        socket.send(JSON.stringify(mediaMessage));
-      }
-      
-      // Track latency
-      const processingTime = Date.now() - startTime;
-      latencyTracker.record(processingTime);
-      
-      if (processingTime > 400) {
-        logger.warn(`High latency detected: ${processingTime}ms for call ${callId}`);
-      }
-      
-    } catch (error) {
-      logger.error(`Audio processing error for call ${callId}: ${error.message}`);
-      // Don't crash - just skip this chunk
-    }
-  }
+  // Note: The Twilio path receives audio FROM the callee. We do NOT transform it
+  // or send it back — that would create echo. Voice transformation happens only on
+  // the CLIENT path (handleClientAudioStream) which transforms the caller's voice
+  // and forwards it to Twilio for the callee to hear.
   
   // Handle incoming WebSocket messages
   socket.on('message', async (rawData) => {
@@ -133,17 +75,8 @@ export function handleMediaStream(socket, options) {
           break;
           
         case 'media':
-          // Receive audio chunk from Twilio
-          const payload = Buffer.from(message.media.payload, 'base64');
-          audioBuffer.push(payload);
-          
-          // Process when buffer is ready
-          if (audioBuffer.isReady()) {
-            // Don't await - process asynchronously to avoid blocking
-            processAudioBuffer().catch(err => {
-              logger.error(`Async processing error: ${err.message}`);
-            });
-          }
+          // Callee audio received from Twilio — no processing needed for now
+          // Future: forward to browser so caller can hear the callee
           break;
           
         case 'mark':
@@ -152,19 +85,8 @@ export function handleMediaStream(socket, options) {
           break;
           
         case 'stop':
-          logger.info(`Stream stopped for call ${callId}`);
+          logger.info(`Twilio stream stopped for call ${callId}`);
           isConnected = false;
-          
-          // Cleanup
-          await voiceTransformer.closeStream(callId);
-          
-          // Remove audio bridge
-          audioBridge.removeBridge(callId);
-          
-          // Log metrics
-          const metrics = latencyTracker.getMetrics();
-          logger.info(`Call ${callId} metrics: avg=${metrics.average}ms, max=${metrics.max}ms, min=${metrics.min}ms`);
-          
           callManager.removeActiveStream(callId);
           break;
           
@@ -178,9 +100,8 @@ export function handleMediaStream(socket, options) {
   });
   
   socket.on('close', () => {
-    logger.info(`WebSocket closed for call ${callId}`);
+    logger.info(`Twilio WebSocket closed for call ${callId}`);
     isConnected = false;
-    voiceTransformer.closeStream(callId).catch(() => {});
     callManager.removeActiveStream(callId);
   });
   
