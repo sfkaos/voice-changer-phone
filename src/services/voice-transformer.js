@@ -14,9 +14,10 @@ const logger = createLogger('voice-transformer');
 const ELEVENLABS_API_URL = 'https://api.elevenlabs.io/v1';
 const API_KEY = process.env.ELEVENLABS_API_KEY;
 
-// Model options - flash for low latency
+// Model options for Speech-to-Speech (voice conversion)
+// Only STS models support voice conversion — TTS-only models like eleven_flash_v2_5 will error
 const DEFAULT_MODEL = 'eleven_english_sts_v2';
-const FLASH_MODEL = 'eleven_flash_v2_5';  // Lower latency
+const MULTILINGUAL_MODEL = 'eleven_multilingual_sts_v2';
 
 export class VoiceTransformer {
   constructor() {
@@ -73,9 +74,9 @@ export class VoiceTransformer {
       // Convert PCM buffer to WAV format for API
       const wavBuffer = this.pcmToWav(pcmBuffer, sampleRate);
       
-      // Use streaming endpoint for low latency
-      const useFlash = process.env.USE_FLASH_MODEL === 'true';
-      const modelId = useFlash ? FLASH_MODEL : DEFAULT_MODEL;
+      // Select STS model (both support voice conversion)
+      const useMultilingual = process.env.USE_MULTILINGUAL_MODEL === 'true';
+      const modelId = useMultilingual ? MULTILINGUAL_MODEL : DEFAULT_MODEL;
       
       const response = await this.callSpeechToSpeechAPI(voiceId, wavBuffer, {
         modelId,
