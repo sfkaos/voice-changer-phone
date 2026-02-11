@@ -113,7 +113,12 @@ export function handleMediaStream(socket, options) {
           
           // Initialize voice transformer for this stream
           await voiceTransformer.initializeStream(callId, voicePreset);
-          
+
+          // Ensure bridge exists (Twilio may connect before the client WebSocket)
+          if (!audioBridge.getBridgeStatus(callId)) {
+            audioBridge.createBridge(callId, voicePreset);
+          }
+
           // Connect Twilio stream to audio bridge
           audioBridge.connectTwilioStream(callId, socket, streamSid);
           break;
@@ -199,112 +204,154 @@ export function createClearMessage(streamSid) {
 
 /**
  * Handle Client Audio Stream WebSocket connection
- * Receives microphone audio from browser, transforms it, forwards to Twilio call
+ * Receives raw PCM Int16 audio from browser AudioWorklet, transforms the voice
+ * via ElevenLabs, encodes to mu-law, and forwards to the Twilio call.
  */
 export function handleClientAudioStream(socket, options) {
   const { callId, voicePreset, callManager, voiceTransformer, audioBridge, logger } = options;
-  
+
   // State
-  let isConnected = false;
+  let clientSampleRate = null;
   let audioChunkCount = 0;
-  
-  logger.info(`🎤 Client audio stream started for call ${callId}`);
-  
+  let pcmAudioBuffer = null; // AudioBuffer for PCM at client sample rate
+  const latencyTracker = new LatencyTracker();
+
+  logger.info(`Client audio stream started for call ${callId}, voice preset: ${voicePreset}`);
+
   // Create or get audio bridge for this call
   if (!audioBridge.getBridgeStatus(callId)) {
     audioBridge.createBridge(callId, voicePreset);
   }
-  
+
   // Connect client stream to audio bridge
   audioBridge.connectClientStream(callId, socket);
-  
+
   // Track active client stream
   callManager.addClientStream(callId, {
     voicePreset,
     startTime: Date.now(),
   });
-  
-  // Handle incoming audio chunks from browser
-  socket.on('message', async (audioData) => {
+
+  // Initialize voice transformer stream for this call
+  voiceTransformer.initializeStream(callId, voicePreset).catch(err => {
+    logger.error(`Failed to initialize voice transformer for call ${callId}: ${err.message}`);
+  });
+
+  // Process buffered PCM: resample -> transform -> resample -> mulaw -> Twilio
+  async function processClientBuffer() {
+    if (!pcmAudioBuffer) return;
+
+    const pcmChunk = pcmAudioBuffer.flush();
+    if (!pcmChunk || pcmChunk.length === 0) return;
+
+    const startTime = Date.now();
+
     try {
-      audioChunkCount++;
-      
-      // Log every chunk initially to debug
-      logger.info(`📤 Received client audio chunk ${audioChunkCount} (${audioData.length} bytes) for call ${callId}`);
-      
-      // Audio data comes as WebM/Opus from MediaRecorder
-      // We need to:
-      // 1. Convert WebM to raw PCM
-      // 2. Transform the voice 
-      // 3. Convert to μ-law for Twilio
-      // 4. Send to active Twilio call
-      
-      const startTime = Date.now();
-      
-      // Forward audio to bridge for processing and forwarding to Twilio
-      await audioBridge.processClientAudio(callId, audioData);
-      
-      // Also log for debugging (can be removed later)
-      await processClientAudio(audioData, callId, voicePreset, voiceTransformer, logger);
-      
-      const processingTime = Date.now() - startTime;
-      if (processingTime > 50) {
-        logger.warn(`Client audio processing took ${processingTime}ms for call ${callId}`);
+      // 1. Resample from client sample rate to 16kHz for ElevenLabs
+      const pcm16k = resample(pcmChunk, clientSampleRate, SAMPLE_RATE_ELEVENLABS);
+
+      // 2. Transform voice via ElevenLabs (the core feature)
+      const transformedPcm = await voiceTransformer.transform(pcm16k, voicePreset, {
+        sampleRate: SAMPLE_RATE_ELEVENLABS,
+      });
+
+      if (!transformedPcm || transformedPcm.length === 0) {
+        logger.warn(`Empty transformation result for call ${callId}`);
+        return;
       }
-      
+
+      // 3. Resample transformed audio from 16kHz to 8kHz for Twilio
+      const pcm8k = resample(transformedPcm, SAMPLE_RATE_ELEVENLABS, SAMPLE_RATE_TWILIO);
+
+      // 4. Encode to mu-law
+      const mulawOutput = mulawEncode(pcm8k);
+
+      // 5. Forward to Twilio via the audio bridge
+      audioBridge.forwardAudioToTwilio(callId, mulawOutput);
+
+      // Track latency
+      const processingTime = Date.now() - startTime;
+      latencyTracker.record(processingTime);
+
+      if (processingTime > 400) {
+        logger.warn(`High client audio latency: ${processingTime}ms for call ${callId}`);
+      }
+
     } catch (error) {
-      logger.error(`Client audio processing error for call ${callId}: ${error.message}`);
+      logger.error(`Client audio transform error for call ${callId}: ${error.message}`);
+    }
+  }
+
+  // Handle incoming messages from browser
+  socket.on('message', async (data) => {
+    try {
+      // First message should be a JSON config with the client's sample rate
+      if (!clientSampleRate) {
+        try {
+          const config = JSON.parse(data.toString());
+          if (config.type === 'config' && config.sampleRate) {
+            clientSampleRate = config.sampleRate;
+            // PCM Int16 = 2 bytes per sample, so bytesPerMs = sampleRate * 2 / 1000
+            // AudioBuffer expects bytesPerMs as sampleRate/1000 (for 1-byte-per-sample formats)
+            // For 16-bit PCM, we create the buffer with sampleRate*2 to account for 2 bytes/sample
+            pcmAudioBuffer = new AudioBuffer(BUFFER_MS, clientSampleRate * 2);
+            logger.info(`Client audio config: sampleRate=${clientSampleRate}, channels=${config.channels}, encoding=${config.encoding} for call ${callId}`);
+            return;
+          }
+        } catch {
+          // Not JSON - could be binary PCM without config, default to 48kHz
+          clientSampleRate = 48000;
+          pcmAudioBuffer = new AudioBuffer(BUFFER_MS, clientSampleRate * 2);
+          logger.warn(`No config message received, defaulting to ${clientSampleRate}Hz for call ${callId}`);
+        }
+      }
+
+      // Subsequent messages are raw PCM Int16 binary data
+      const audioData = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      audioChunkCount++;
+
+      if (audioChunkCount <= 3) {
+        logger.info(`Client audio chunk #${audioChunkCount}: ${audioData.length} bytes for call ${callId}`);
+      }
+
+      // Buffer the PCM data
+      pcmAudioBuffer.push(audioData);
+
+      // Process when buffer has accumulated enough data (~200ms)
+      if (pcmAudioBuffer.isReady()) {
+        processClientBuffer().catch(err => {
+          logger.error(`Async client audio processing error: ${err.message}`);
+        });
+      }
+
+    } catch (error) {
+      logger.error(`Client audio message error for call ${callId}: ${error.message}`);
     }
   });
-  
+
   socket.on('open', () => {
     logger.info(`Client audio stream connected for call ${callId}`);
-    isConnected = true;
   });
-  
+
   socket.on('close', () => {
     logger.info(`Client audio stream closed for call ${callId}`);
-    isConnected = false;
-    
-    // Remove bridge if both streams are closed
+
+    // Log metrics
+    const metrics = latencyTracker.getMetrics();
+    if (metrics.count > 0) {
+      logger.info(`Client audio metrics for ${callId}: avg=${metrics.average}ms, max=${metrics.max}ms, count=${metrics.count}`);
+    }
+
+    // Cleanup voice transformer stream
+    voiceTransformer.closeStream(callId).catch(() => {});
+
+    // Remove bridge
     audioBridge.removeBridge(callId);
-    
+
     callManager.removeClientStream?.(callId);
   });
-  
+
   socket.on('error', (error) => {
     logger.error(`Client audio stream error for call ${callId}: ${error.message}`);
   });
-}
-
-/**
- * Process client audio data 
- * Currently logs received audio - needs full WebM->Voice Transform->Twilio pipeline
- */
-async function processClientAudio(webmAudioData, callId, voicePreset, voiceTransformer, logger) {
-  // Log that we're processing audio
-  logger.info(`🎵 Processing ${webmAudioData.length} bytes of client audio for call ${callId} with voice ${voicePreset}`);
-  
-  // TODO: Full implementation needs:
-  // 1. WebM/Opus decoder (ffmpeg or web audio API)
-  // 2. Voice transformation via ElevenLabs 
-  // 3. Audio encoding to μ-law
-  // 4. Send to Twilio Media Stream for the active call
-  
-  // For now, verify we can access the voice transformer
-  try {
-    // This doesn't do actual transformation yet, but validates the service
-    logger.info(`🎭 Voice transformer available for preset: ${voicePreset}`);
-    
-    // TODO: Implement actual audio pipeline here
-    // const pcmAudio = await decodeWebM(webmAudioData);
-    // const transformedAudio = await voiceTransformer.transform(pcmAudio, voicePreset);  
-    // const mulawAudio = await encodeMulaw(transformedAudio);
-    // await sendToTwilioCall(callId, mulawAudio);
-    
-  } catch (error) {
-    logger.error(`Voice processing failed: ${error.message}`);
-  }
-  
-  return true;
 }

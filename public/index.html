@@ -572,73 +572,99 @@
       requestAnimationFrame(updateMicLevel);
     }
     
+    // AudioWorklet processor code (inline via Blob URL)
+    const pcmProcessorCode = `
+      class PCMProcessor extends AudioWorkletProcessor {
+        process(inputs, outputs, parameters) {
+          const input = inputs[0];
+          if (!input || !input[0]) return true;
+
+          const float32 = input[0];
+          const int16 = new Int16Array(float32.length);
+          for (let i = 0; i < float32.length; i++) {
+            const s = Math.max(-1, Math.min(1, float32[i]));
+            int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+          this.port.postMessage(int16.buffer, [int16.buffer]);
+          return true;
+        }
+      }
+      registerProcessor('pcm-processor', PCMProcessor);
+    `;
+
     // Setup audio streaming WebSocket
     function setupAudioStreaming(callId, voicePreset) {
       if (!mediaStream) {
         showAlert('error', 'Microphone not enabled');
         return;
       }
-      
+
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/client-audio-stream?callId=${callId}&voice=${voicePreset}`;
-      
+
       audioWebSocket = new WebSocket(wsUrl);
-      
+
       audioWebSocket.onopen = function() {
         console.log('Audio WebSocket connected');
         isStreamingAudio = true;
-        
-        // Start streaming microphone audio
+
+        // Send config message so server knows the sample rate for resampling
+        audioWebSocket.send(JSON.stringify({
+          type: 'config',
+          sampleRate: audioContext.sampleRate,
+          channels: 1,
+          encoding: 'int16'
+        }));
+
+        // Start streaming microphone audio via AudioWorklet
         startAudioStream();
       };
-      
+
       audioWebSocket.onclose = function() {
         console.log('Audio WebSocket disconnected');
         isStreamingAudio = false;
       };
-      
+
       audioWebSocket.onerror = function(error) {
         console.error('Audio WebSocket error:', error);
         showAlert('error', 'Failed to connect audio stream');
       };
     }
-    
-    // Start streaming microphone audio
-    function startAudioStream() {
+
+    // Start streaming microphone audio as raw PCM Int16
+    async function startAudioStream() {
       if (!mediaStream || !audioWebSocket || !isStreamingAudio) return;
-      
-      console.log('🎤 Starting audio stream...');
-      
-      // Create a MediaRecorder to capture audio
-      const mediaRecorder = new MediaRecorder(mediaStream, {
-        mimeType: 'audio/webm;codecs=opus',
-        audioBitsPerSecond: 16000
-      });
-      
-      mediaRecorder.ondataavailable = function(event) {
-        if (event.data.size > 0 && audioWebSocket.readyState === WebSocket.OPEN) {
-          console.log(`📤 Sending audio chunk: ${event.data.size} bytes`);
-          // Send audio chunk to server for voice transformation
-          audioWebSocket.send(event.data);
-        }
-      };
-      
-      mediaRecorder.onstart = function() {
-        console.log('🎤 MediaRecorder started');
-      };
-      
-      mediaRecorder.onerror = function(event) {
-        console.error('❌ MediaRecorder error:', event);
-        showAlert('error', 'Microphone recording failed: ' + event.error);
-      };
-      
-      // Stream in small chunks for low latency
-      mediaRecorder.start(100); // 100ms chunks
-      
-      console.log('🎤 MediaRecorder.start(100) called');
-      
-      // Store for cleanup
-      window.activeMediaRecorder = mediaRecorder;
+
+      console.log('Starting PCM audio stream (sampleRate: ' + audioContext.sampleRate + ')');
+
+      try {
+        // Register AudioWorklet processor via Blob URL
+        const blob = new Blob([pcmProcessorCode], { type: 'application/javascript' });
+        const blobUrl = URL.createObjectURL(blob);
+        await audioContext.audioWorklet.addModule(blobUrl);
+        URL.revokeObjectURL(blobUrl);
+
+        // Create worklet node and connect mic source to it
+        const pcmNode = new AudioWorkletNode(audioContext, 'pcm-processor');
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        source.connect(pcmNode);
+
+        // Send raw PCM Int16 buffers over WebSocket
+        pcmNode.port.onmessage = function(event) {
+          if (audioWebSocket && audioWebSocket.readyState === WebSocket.OPEN) {
+            audioWebSocket.send(event.data);
+          }
+        };
+
+        // Store for cleanup
+        window.activePcmNode = pcmNode;
+        window.activePcmSource = source;
+
+        console.log('PCM AudioWorklet streaming started');
+      } catch (error) {
+        console.error('Failed to start AudioWorklet:', error);
+        showAlert('error', 'Failed to start audio capture: ' + error.message);
+      }
     }
     
     // Load available voices
@@ -851,9 +877,13 @@
         audioWebSocket = null;
       }
       
-      if (window.activeMediaRecorder) {
-        window.activeMediaRecorder.stop();
-        window.activeMediaRecorder = null;
+      if (window.activePcmNode) {
+        window.activePcmNode.disconnect();
+        window.activePcmNode = null;
+      }
+      if (window.activePcmSource) {
+        window.activePcmSource.disconnect();
+        window.activePcmSource = null;
       }
       
       activeCallSid = null;

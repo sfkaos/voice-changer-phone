@@ -80,71 +80,37 @@ export class AudioBridge {
   }
   
   /**
-   * Process client audio and forward to Twilio call
+   * Forward already-transformed mu-law audio to the Twilio Media Stream.
+   * Called by media-stream.js after the full PCM -> transform -> resample -> mulaw pipeline.
+   *
+   * @param {string} callId - The call identifier
+   * @param {Buffer} mulawBuffer - mu-law encoded audio ready for Twilio
    */
-  async processClientAudio(callId, audioData) {
+  forwardAudioToTwilio(callId, mulawBuffer) {
     const bridge = this.activeBridges.get(callId);
     if (!bridge) {
-      logger.warn(`No bridge found for call ${callId} - dropping audio`);
+      logger.warn(`Cannot forward audio - no bridge for call ${callId}`);
       return;
     }
-    
-    // Add to queue for processing
-    bridge.audioQueue.push({
-      data: audioData,
-      timestamp: Date.now()
-    });
-    
-    // Start processing if not already running
-    if (!bridge.isProcessing && bridge.twilioStream && bridge.twilioStreamSid) {
-      bridge.isProcessing = true;
-      this.processAudioQueue(callId);
-    }
-  }
-  
-  /**
-   * Process queued audio chunks
-   */
-  async processAudioQueue(callId) {
-    const bridge = this.activeBridges.get(callId);
-    if (!bridge) return;
-    
-    while (bridge.audioQueue.length > 0) {
-      const audioChunk = bridge.audioQueue.shift();
-      
-      try {
-        // For now, send raw audio without transformation
-        // TODO: Implement WebM -> PCM -> Transform -> μ-law pipeline
-        await this.forwardAudioToTwilio(bridge, audioChunk.data);
-        
-      } catch (error) {
-        logger.error(`Audio processing error for call ${callId}: ${error.message}`);
-      }
-    }
-    
-    bridge.isProcessing = false;
-  }
-  
-  /**
-   * Forward audio to Twilio Media Stream (placeholder implementation)
-   */
-  async forwardAudioToTwilio(bridge, audioData) {
+
     if (!bridge.twilioStream || !bridge.twilioStreamSid) {
-      logger.warn(`Cannot forward audio - Twilio stream not connected for call ${bridge.callId}`);
+      logger.warn(`Cannot forward audio - Twilio stream not connected for call ${callId}`);
       return;
     }
-    
-    logger.info(`🎵 Forwarding ${audioData.length} bytes to Twilio stream ${bridge.twilioStreamSid}`);
-    
-    // TODO: Implement actual audio forwarding
-    // This requires:
-    // 1. Convert WebM to PCM
-    // 2. Transform with voice preset  
-    // 3. Convert to μ-law
-    // 4. Send as Twilio media message
-    
-    // For now, just log that we would forward the audio
-    logger.info(`📞 Would send transformed audio to call ${bridge.callId}`);
+
+    const mediaMessage = JSON.stringify({
+      event: 'media',
+      streamSid: bridge.twilioStreamSid,
+      media: {
+        payload: mulawBuffer.toString('base64'),
+      },
+    });
+
+    if (bridge.twilioStream.readyState === bridge.twilioStream.OPEN) {
+      bridge.twilioStream.send(mediaMessage);
+    } else {
+      logger.warn(`Twilio WebSocket not open (state=${bridge.twilioStream.readyState}) for call ${callId}`);
+    }
   }
   
   /**
@@ -159,7 +125,7 @@ export class AudioBridge {
     logger.info(`   Twilio: ${bridge.twilioStream ? 'Connected' : 'Missing'}`);
     logger.info(`   StreamSid: ${bridge.twilioStreamSid || 'Missing'}`);
     
-    // Processing will happen as client audio arrives via processClientAudio()
+    // Processing happens in media-stream.js; transformed audio arrives via forwardAudioToTwilio()
   }
   
   /**
