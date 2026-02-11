@@ -118,7 +118,9 @@ fastify.register(async function (fastify) {
  * Returns TwiML that sets up bidirectional Media Stream
  */
 fastify.post('/voice', async (request, reply) => {
-  const { voicePreset = 'deep_male', toNumber } = request.body || {};
+  // voicePreset comes from query string (set in call-manager webhook URL), NOT from Twilio's POST body
+  const params = new URL(request.url, `http://${request.headers.host}`).searchParams;
+  const voicePreset = params.get('voicePreset') || request.body?.voicePreset || 'deep_male';
   const callId = request.body?.CallSid || `call_${Date.now()}`;
   
   logger.info(`🔥 POST /voice webhook called!`);

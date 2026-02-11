@@ -195,6 +195,10 @@ export function handleClientAudioStream(socket, options) {
       // 1. Resample from client sample rate to 16kHz for ElevenLabs
       const pcm16k = resample(pcmChunk, clientSampleRate, SAMPLE_RATE_ELEVENLABS);
 
+      if (audioChunkCount <= 5) {
+        logger.info(`Pipeline[${callId}]: input=${pcmChunk.length}B@${clientSampleRate}Hz -> resampled=${pcm16k.length}B@${SAMPLE_RATE_ELEVENLABS}Hz`);
+      }
+
       // 2. Transform voice via ElevenLabs (the core feature)
       const transformedPcm = await voiceTransformer.transform(pcm16k, voicePreset, {
         sampleRate: SAMPLE_RATE_ELEVENLABS,
@@ -210,6 +214,10 @@ export function handleClientAudioStream(socket, options) {
 
       // 4. Encode to mu-law
       const mulawOutput = mulawEncode(pcm8k);
+
+      if (audioChunkCount <= 5) {
+        logger.info(`Pipeline[${callId}]: transformed=${transformedPcm.length}B -> 8k=${pcm8k.length}B -> mulaw=${mulawOutput.length}B`);
+      }
 
       // 5. Forward to Twilio via the audio bridge
       audioBridge.forwardAudioToTwilio(callId, mulawOutput);

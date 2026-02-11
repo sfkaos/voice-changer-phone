@@ -107,18 +107,18 @@ export class VoiceTransformer {
    */
   async callSpeechToSpeechAPI(voiceId, audioBuffer, options) {
     const { modelId, outputFormat, voiceSettings } = options;
-    
+
     const formData = new FormData();
     formData.append('audio', new Blob([audioBuffer], { type: 'audio/wav' }), 'input.wav');
     formData.append('model_id', modelId);
-    formData.append('output_format', outputFormat);
-    
+
     if (voiceSettings) {
       formData.append('voice_settings', JSON.stringify(voiceSettings));
     }
-    
-    const url = `${ELEVENLABS_API_URL}/speech-to-speech/${voiceId}`;
-    
+
+    // output_format must be a query parameter, NOT form data
+    const url = `${ELEVENLABS_API_URL}/speech-to-speech/${voiceId}?output_format=${outputFormat}`;
+
     const response = await fetch(url, {
       method: 'POST',
       headers: {
@@ -126,14 +126,15 @@ export class VoiceTransformer {
       },
       body: formData,
     });
-    
+
     if (!response.ok) {
       const errorText = await response.text();
       throw new Error(`ElevenLabs API error: ${response.status} - ${errorText}`);
     }
-    
-    // Get audio data from response
+
+    // Get raw PCM audio data from response
     const arrayBuffer = await response.arrayBuffer();
+    logger.info(`ElevenLabs response: ${arrayBuffer.byteLength} bytes, content-type: ${response.headers.get('content-type')}`);
     return Buffer.from(arrayBuffer);
   }
   
